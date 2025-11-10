@@ -45,12 +45,115 @@ TOPIC_REL_OUT_POSE      = "/ee_to_obj_pose"
 INPUT_FRAME = "optical"
 
 # ------------------- 外参（base_link <- camera_optical） -------------------
+# 支持两种模式：固定外参 or 自动计算外参
+
+USE_AUTO_EXTRINSICS =  True  # True: 自动计算，False: 固定
+print(f"[EXTRINSICS] USE_AUTO_EXTRINSICS = {USE_AUTO_EXTRINSICS}")
+
 EXTRINSICS = {
     "translation": [0.06822573754593178, -1.0755729148748657e-05, 0.7178047690557512],
     "quaternion_xyzw": [-0.6119166374409138, 0.6119925321992996, -0.3542981098668795, 0.3542541724525645],
     "base_frame": "base_link",
     "camera_frame": "cam_h_color_optical_frame"
 }
+
+# --- 自动计算外参的独立子模块 ---
+def compute_extrinsics_from_bag(mjcf_path, bag_path, base_body="base_link", camera_body="head_camera", joint_names=None):
+    print(f"[EXTRINSICS] 自动计算外参: mjcf_path={mjcf_path}, bag_path={bag_path}, base_body={base_body}, camera_body={camera_body}")
+    import mujoco
+    import rosbag
+    import numpy as np
+    from scipy.spatial.transform import Rotation as R
+
+    # 1. 读取一帧 joint_q
+    with rosbag.Bag(bag_path, "r") as bag:
+        found = False
+        for topic, msg, t in bag.read_messages():
+            if hasattr(msg, "joint_data") and hasattr(msg.joint_data, "joint_q"):
+                q = list(msg.joint_data.joint_q)
+                print(f"[EXTRINSICS] 读取到 joint_q: {q}")
+                found = True
+                break
+        if not found:
+            raise RuntimeError("未找到 joint_q 数据")
+
+    # 2. 关节名与 joint_q 对应（这里只取头部关节，默认采用 joint_q 的末尾两个值，
+    #    因为有些数据流把头部放在最后；如果需要其它索引，可传入 joint_names
+    if joint_names is None:
+        print("[EXTRINSICS] 未传入 joint_names，默认使用头部关节 zhead_1_joint 和 zhead_2_joint")
+        joint_names = ["zhead_1_joint", "zhead_2_joint"]
+    qpos_dict = {}
+    qlen = len(q)
+    n_head = len(joint_names)
+    # 默认从 joint_q 末尾取对应数量的关节值
+    for i, name in enumerate(joint_names):
+        idx = qlen - n_head + i
+        if 0 <= idx < qlen:
+            qpos_dict[name] = float(q[idx])
+        else:
+            # 退回到从头开始的映射（向后兼容）
+            qpos_dict[name] = float(q[i])
+    print(f"[EXTRINSICS] joint_q length={qlen}, using indices {[qlen-n_head+i for i in range(n_head)]}")
+    print(f"[EXTRINSICS] qpos_dict: {qpos_dict}")
+
+    # 3. MuJoCo FK
+    model = mujoco.MjModel.from_xml_path(mjcf_path)
+    data = mujoco.MjData(model)
+    joint_name_to_adr = {mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j_id): int(model.jnt_qposadr[j_id]) for j_id in range(model.njnt)}
+    for name, pos in qpos_dict.items():
+        adr = joint_name_to_adr.get(name)
+        if adr is not None:
+            data.qpos[adr] = pos
+    mujoco.mj_forward(model, data)
+    print(f"[EXTRINSICS] MuJoCo qpos: {data.qpos}")
+
+    # 4. 获取 base_link 和 head_camera（物理）的世界位姿
+    bid_base = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_body)
+    bid_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, camera_body)
+    print(f"[EXTRINSICS] base_body id: {bid_base}, camera_body id: {bid_cam}")
+    H_world_base = np.eye(4)
+    H_world_base[:3, :3] = data.xmat[bid_base].reshape(3, 3)
+    H_world_base[:3, 3] = data.xpos[bid_base]
+    H_world_cam = np.eye(4)
+    H_world_cam[:3, :3] = data.xmat[bid_cam].reshape(3, 3)
+    H_world_cam[:3, 3] = data.xpos[bid_cam]
+    print(f"[EXTRINSICS] H_world_base: {H_world_base}")
+    print(f"[EXTRINSICS] H_world_cam: {H_world_cam}")
+
+    # 5. 先算 base_link 到 head_camera（物理）
+    H_base_cam_phys = np.linalg.inv(H_world_base) @ H_world_cam
+    print(f"[EXTRINSICS] H_base_cam_phys: {H_base_cam_phys}")
+    # 6. 再右乘物理到光学的旋转，得到 base_link 到 camera_optical
+    H_physical_optical = np.eye(4)
+    H_physical_optical[:3, :3] = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]], dtype=float)
+    H_base_camopt = H_base_cam_phys @ H_physical_optical
+    print(f"[EXTRINSICS] H_base_camopt: {H_base_camopt}")
+
+    t = H_base_camopt[:3, 3].tolist()
+    q = R.from_matrix(H_base_camopt[:3, :3]).as_quat()  # xyzw
+    print(f"[EXTRINSICS] translation: {t}")
+    print(f"[EXTRINSICS] quaternion_xyzw: {q}")
+    return {
+        "translation": t,
+        "quaternion_xyzw": q.tolist(),
+        "base_frame": base_body,
+        "camera_frame": "cam_h_color_optical_frame"
+    }
+
+# --- 选择模式 ---
+if USE_AUTO_EXTRINSICS:
+    # 这里 bag_path 需指定一包含头部关节的 bag 文件，默认用 IN_DIR 下第一个 bag
+    bags = sorted(glob.glob(os.path.join(IN_DIR, "*.bag")))
+    if not bags:
+        raise RuntimeError(f"未找到 bag 文件于 {IN_DIR}")
+    print(f"[EXTRINSICS] 自动外参计算将使用 bag: {bags[0]}")
+    EXTRINSICS = compute_extrinsics_from_bag(
+        mjcf_path=MJCF_PATH,
+        bag_path=bags[0],
+        base_body="base_link",
+        camera_body="head_camera",
+        joint_names=["zhead_1_joint", "zhead_2_joint"]
+    )
 
 # 光学(RDF) <-> 物理(FLU) 的固定旋转
 R_PHYSICAL_FROM_OPTICAL = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]], dtype=float)
