@@ -262,7 +262,7 @@ def process_one_bag(bag_in):
     H_opt_from_phys = np.eye(4); H_opt_from_phys[:3,:3] = R_OPTICAL_FROM_PHYSICAL
 
     bag_name = os.path.basename(bag_in); out_path = os.path.join(OUT_DIR, bag_name)
-    print(f"\n[INFO] 处理: {bag_in}")
+    print(f"\n[INFO] 处理: {bag_in}") 
     ensure_out_dir()
 
     obj_t_ros, obj_t_sec, obj_H_cam = [], [], []
