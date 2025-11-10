@@ -107,23 +107,44 @@ def compute_extrinsics_from_bag(mjcf_path, bag_path, base_body="base_link", came
     mujoco.mj_forward(model, data)
     print(f"[EXTRINSICS] MuJoCo qpos: {data.qpos}")
 
-    # 4. 获取 base_link 和 head_camera（物理）的世界位姿
+    # 4. 获取 base_link（body）和 head_camera（camera）的世界位姿
     bid_base = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, base_body)
-    bid_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, camera_body)
-    print(f"[EXTRINSICS] base_body id: {bid_base}, camera_body id: {bid_cam}")
+    print(f"[EXTRINSICS] base_body id: {bid_base}")
     H_world_base = np.eye(4)
     H_world_base[:3, :3] = data.xmat[bid_base].reshape(3, 3)
     H_world_base[:3, 3] = data.xpos[bid_base]
-    H_world_cam = np.eye(4)
-    H_world_cam[:3, :3] = data.xmat[bid_cam].reshape(3, 3)
-    H_world_cam[:3, 3] = data.xpos[bid_cam]
-    print(f"[EXTRINSICS] H_world_base: {H_world_base}")
-    print(f"[EXTRINSICS] H_world_cam: {H_world_cam}")
 
-    # 5. 先算 base_link 到 head_camera（物理）
-    H_base_cam_phys = np.linalg.inv(H_world_base) @ H_world_cam
+    #   注意：head_camera 是 MuJoCo 的 camera 对象，不是 body，这里按 camera 读取
+    cid_cam = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, camera_body)
+    if cid_cam < 0:
+        raise KeyError(f"找不到 MuJoCo camera '{camera_body}'")
+    print(f"[EXTRINSICS] camera id: {cid_cam}")
+    H_world_cam_mj = np.eye(4)
+    H_world_cam_mj[:3, :3] = data.cam_xmat[cid_cam].reshape(3, 3)
+    H_world_cam_mj[:3, 3] = data.cam_xpos[cid_cam]
+    print(f"[EXTRINSICS] H_world_base: {H_world_base}")
+    print(f"[EXTRINSICS] H_world_cam(mj): {H_world_cam_mj}")
+
+    # 5. MuJoCo camera 坐标系 -> 物理相机(FLU)坐标系
+    #    MuJoCo camera: +X右 +Y上 +Z朝后(看向 -Z)
+    #    物理相机(FLU): +X前 +Y左 +Z上
+    R_PHYS_FROM_MJ = np.array([
+        [ 0.,  0., -1.],
+        [-1.,  0.,  0.],
+        [ 0.,  1.,  0.],
+    ], dtype=float)
+    #   右乘时应使用 C_mj_T_C_phys 的旋转，即 R_mj_from_phys = (R_phys_from_mj)^T
+    R_MJ_FROM_PHYS = R_PHYS_FROM_MJ.T
+    H_cam_phys_in_cam_mj = np.eye(4); H_cam_phys_in_cam_mj[:3, :3] = R_MJ_FROM_PHYS
+
+    #   世界到相机(物理)位姿：在相机局部右乘坐标变换
+    H_world_cam_phys = H_world_cam_mj @ H_cam_phys_in_cam_mj
+
+    # 6. 先算 base_link 到 camera（物理）
+    H_base_cam_phys = np.linalg.inv(H_world_base) @ H_world_cam_phys
     print(f"[EXTRINSICS] H_base_cam_phys: {H_base_cam_phys}")
-    # 6. 再右乘物理到光学的旋转，得到 base_link 到 camera_optical
+
+    # 7. 再右乘物理到光学的旋转，得到 base_link 到 camera_optical（沿用你原有定义）
     H_physical_optical = np.eye(4)
     H_physical_optical[:3, :3] = np.array([[0., 0., 1.], [-1., 0., 0.], [0., -1., 0.]], dtype=float)
     H_base_camopt = H_base_cam_phys @ H_physical_optical
