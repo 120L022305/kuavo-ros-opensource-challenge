@@ -1,0 +1,5 @@
+add_other/add_pose/
+
+add_other/add_grasp_metrics/
+
+*/*.bag
